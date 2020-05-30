@@ -135,7 +135,7 @@ def build_fork(arguments)
     end
     log_info "base LLVM upstream SHA: #{upstream_base_llvm_sha}"
 
-    version_name = "9.0-#{Date.today.strftime("%Y-%m-%d")}"
+    version_name = "10.0-#{Date.today.strftime("%Y-%m-%d")}"
 
     log_step("checking out the rust-lang/llvm commit (#{upstream_rust_llvm_sha})") { run(["git", "checkout", upstream_rust_llvm_sha]) }
     # keep track of the originating rust-lang ref in a branch.
