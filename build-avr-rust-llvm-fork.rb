@@ -22,6 +22,8 @@ module DefaultOptions
   # than actual upstream Rust.
   UPSTREAM_RUST_URL = "https://github.com/avr-rust/rust.git"
   UPSTREAM_RUST_REF = "avr-support-upstream"
+
+  CONFLICT_ACTION = $stdout.isatty ? "prompt" : "abort"
 end
 
 class GeneralError < StandardError; end
@@ -31,35 +33,35 @@ class InvalidCliOptionError < GeneralError; end
 
 module Support
   module Prelude
+    CLI_TARGET_WIDTH = 80
+
     def fatal_error(message)
       $stderr.puts "error: #{message}"
       exit 1
     end
 
-    def step(description, &block)
-      hr = '=' * 40
+    def ruled_heading(heading, ruler = '=', vertical_padding: false)
+      heading_so_far = "#{ruler*13} #{heading.strip} "
+      full_heading = heading_so_far + (ruler * [0, CLI_TARGET_WIDTH - heading_so_far.length].max)
 
-      puts "#{hr}\n#{description.strip}\n#{hr}\n\n"
-      retval = block.call
-
-      puts "#{hr}\n"
-      retval
+      puts if vertical_padding
+      puts full_heading
+      puts if vertical_padding
     end
 
-    def step_newgen(description, details = {}, &block)
-      hr = '=' * 26
+    def step(description, details = {}, &block)
+      thin_hr = '-' * CLI_TARGET_WIDTH
 
-      puts "#{'=' * 13} BEGIN: #{description} #{hr}"
-      puts
+      ruled_heading "BEGIN: #{description}", :vertical_padding => true
+
       unless details.empty?
         puts details.to_a.sort_by(&:first).map { |k, v| "   - #{k.to_s.capitalize}: #{v.inspect}" }.join("\n")
-        puts hr * 3
+        puts thin_hr
       end
 
       retval = block.call
 
-      puts
-      puts "#{hr} END: #{description} #{hr}"
+      ruled_heading " END:   #{description}"
       puts
 
       retval
@@ -110,12 +112,6 @@ module Support
     end
   end
 
-  class Commit < Struct.new(:sha, :summary)
-    def to_s
-      [sha, summary].join(' ')
-    end
-  end
-
   module ConflictAction
     SKIP = "skip"
     ABORT = "abort"
@@ -132,6 +128,8 @@ module Support
           "skip this commit" => lambda { perform_skip! },
           "abort" => lambda { perform_abort! },
         )
+      else
+        raise "unexpected conflict action: #{conflict_action}"
       end
     end
 
@@ -148,16 +146,17 @@ module Support
 end
 
 module GitUtil
+  GeneratedBranch = Struct.new(:name, :repository_path)
+
+  class Commit < Struct.new(:sha, :summary)
+    def to_s
+      [sha, summary].join(' ')
+    end
+  end
+
   def self.get_llvm_submodule_sha(upstream_rust_path:)
     status_parts = run(["git", "submodule", "status", RUST_LLVM_SUBMODULE_RELATIVE_PATH], :chdir => upstream_rust_path).split(' ')
     status_parts.first.gsub('+', '').gsub('-', '')
-  end
-
-  def self.get_llvm_submodule_url(upstream_rust_path:)
-    raw = run(["git", "config", "--blob", "HEAD:.gitmodules",  "--list"], :chdir => upstream_rust_path)
-    parts = raw.lines.map { |line| idx = line.index('='); [line[0..(idx-1)].strip, line[(idx+1)..-1].strip] }.to_h
-
-    parts["submodule.src/llvm-project.url"] or raise "cannot find LLVM submodule URL"
   end
 
   def self.avr_commitlog(ref:, repository_path:, max_count: 1000)
@@ -191,26 +190,40 @@ def build_fork(options)
   datestamp = Date.today.strftime("%Y-%m-%d")
   version_name = "llvm-#{DEFAULT_LLVM_VERSION_NUMBER_FOR_OUTPUT_BRANCHES}-#{datestamp}"
 
+  branch_name_rust_upstream = "avr-rust/rustlang-upstream/#{version_name}"
+  branch_name_avr_fork = "avr-rust/avr-support/#{version_name}"
+
+  upstream_llvm_git_ref = "upstream-llvm/#{options.upstream_llvm_ref}"
+  upstream_rust_git_ref = "upstream-rust/#{options.upstream_rust_ref}"
+
+  generated_branches = []
+
   if File.exists?(destination_directory_rust)
     raise GeneralError, "the target fork directory '#{destination_directory_rust}' already exists"
   end
 
+  # force change the working directory. force the steps to be explicit.
+  Dir.chdir(Dir.mktmpdir('avr-rust-null-workdir'))
+
   FileUtils.mkdir_p(destination_directory_rust)
 
-  step_newgen(
+  step(
     "cloning the upstream Rust repository",
-    "upstream Rust repository" => options.upstream_rust_path_or_url, "destination path" => destination_directory_rust
+    "upstream Rust repository" => options.upstream_rust_path_or_url, "destination path" => destination_directory_rust,
+    "new tracking branch for upstream Rust" => branch_name_rust_upstream,
   ) do
     Dir.chdir(destination_directory_rust) do
       run(["git", "init"])
+      run(["git", "config", "merge.renamelimit", "35000"]) # get rid of annoying warnings
       run(["git", "remote", "add", "upstream-rust", options.upstream_rust_path_or_url])
       run(["git", "fetch", "upstream-rust", options.upstream_rust_ref])
-      run(["git", "checkout", "-b", "avr-rustc/rustlang-upstream/#{version_name}", "upstream-rust/#{options.upstream_rust_ref}"])
 
+      run(["git", "checkout", "-b", branch_name_rust_upstream, upstream_rust_git_ref])
+      generated_branches << GitUtil::GeneratedBranch.new(branch_name_rust_upstream, destination_directory_rust)
     end
   end
 
-  step_newgen(
+  upstream_rust_llvm_sha = step(
     "fetching the upstream Rust LLVM submodule",
     "submodule path" => destination_directory_llvm,
   ) do
@@ -222,46 +235,53 @@ def build_fork(options)
       # rename 'origin' to 'upstream-rust-lang-llvm' for consistency.
       run(["git", "remote", "rename", "origin", "upstream-rust-lang-llvm"])
     end
-  end
 
-  upstream_rust_llvm_url = GitUtil.get_llvm_submodule_url(:upstream_rust_path => destination_directory_rust)
-  upstream_rust_llvm_sha = GitUtil.get_llvm_submodule_sha(:upstream_rust_path => destination_directory_rust)
+    upstream_rust_llvm_sha = GitUtil.get_llvm_submodule_sha(:upstream_rust_path => destination_directory_rust)
+
+    Dir.chdir(destination_directory_llvm) do
+      run(["git", "checkout", "-b", branch_name_rust_upstream, upstream_rust_llvm_sha])
+      generated_branches << GitUtil::GeneratedBranch.new(branch_name_rust_upstream, destination_directory_llvm)
+    end
+
+    upstream_rust_llvm_sha
+  end
 
   log_info "base rust-lang/llvm SHA: #{upstream_rust_llvm_sha}"
 
-  step_newgen(
+  step(
     "fetching changes from upstream LLVM to the Rust LLVM submodule",
     "submodule path" => destination_directory_llvm,
     "upstream LLVM" => options.upstream_llvm_path_or_url,
   ) do
-    run(["git", "remote", "add", "upstream-llvm", options.upstream_llvm_path_or_url])
-    run(["git", "fetch", "upstream-llvm", options.upstream_llvm_ref])
+    Dir.chdir(destination_directory_llvm) do
+      run(["git", "remote", "add", "upstream-llvm", options.upstream_llvm_path_or_url])
+      run(["git", "fetch", "upstream-llvm", options.upstream_llvm_ref])
+    end
   end
 
-  exit 0
+  upstream_base_llvm_sha =
+    step(
+      "finding the commit that both rust-lang and upstream LLVM #{options.upstream_llvm_ref} have in common",
+      "Git reference for Rust LLVM fork" => upstream_rust_llvm_sha,
+      "Git reference for upstream LLVM" => upstream_llvm_git_ref,
 
+  ) do
+    GitUtil.find_rust_llvm_submodule_base_upstream_sha(
+      :rustllvm_ref => upstream_rust_llvm_sha,
+      :llvm_master_ref => upstream_llvm_git_ref,
+      :llvm_repo_path => destination_directory_llvm)
+  end
 
+  log_info "base LLVM upstream SHA: #{upstream_base_llvm_sha}"
 
-  FileUtils.mkdir_p(destination_directory)
+  commits_to_cherry_pick = GitUtil.avr_commitlog(:ref => "#{upstream_rust_llvm_sha}..upstream-llvm/#{options.upstream_llvm_ref}", :repository_path => destination_directory_llvm).reverse
 
-  Dir.chdir(destination_directory) do
-    run(["git", "config", "merge.renamelimit", "35000"]) # get rid of annoying warnings
+  step("cherry-picking new upstream AVR LLVM patches") do
+    Dir.chdir(destination_directory_llvm) do
+      # Create the avr-fork LLVM branch.
+      run(["git", "checkout", "-b", branch_name_avr_fork, branch_name_rust_upstream])
+      generated_branches << GitUtil::GeneratedBranch.new(branch_name_avr_fork, destination_directory_llvm)
 
-    upstream_base_llvm_sha = step("finding the commit that both rust-lang and upstream LLVM #{options.upstream_llvm_ref} have in common") do
-      GitUtil.find_rust_llvm_submodule_base_upstream_sha(:rustllvm_ref => upstream_rust_llvm_sha, :llvm_master_ref => "upstream-llvm/#{options.upstream_llvm_ref}", :llvm_repo_path => '.')
-    end
-    log_info "base LLVM upstream SHA: #{upstream_base_llvm_sha}"
-
-    version_name = "#{DEFAULT_LLVM_VERSION_NUMBER_FOR_OUTPUT_BRANCHES}-#{Date.today.strftime("%Y-%m-%d")}"
-
-    step("checking out the rust-lang/llvm commit (#{upstream_rust_llvm_sha})") { run(["git", "checkout", upstream_rust_llvm_sha]) }
-
-    # keep track of the originating rust-lang ref in a branch.
-    run(["git", "checkout", "-b", "avr-rustc-rustlang-upstream/#{version_name}", upstream_rust_llvm_sha])
-
-    commits_to_cherry_pick = GitUtil.avr_commitlog(:ref => "#{upstream_rust_llvm_sha}..upstream-llvm/#{options.upstream_llvm_ref}", :repository_path => ".").reverse
-
-    step("cherry-picking new upstream AVR LLVM patches") do
       commits_to_cherry_pick.each do |commit|
         begin
           run(["git", "cherry-pick", commit.sha])
@@ -271,18 +291,31 @@ def build_fork(options)
           if GitUtil.is_conflicting?(:repository_path => '.')
             $stdout.puts "NOTE: failed to cherry-pick '#{commit}' due to conflicts"
 
-            ConflictAction.perform!(options.conflict_action)
+            Support::ConflictAction.perform!(options.conflict_action)
           else
             raise # don't handle this error.
           end
         end
       end
     end
-
-    run(["git", "checkout", "-b", "avr-rustc/#{version_name}"])
   end
 
-  puts "finished building the LLVM fork. it can be found at #{destination_directory}"
+  step("creating the final AVR-Rust branch")do
+    Dir.chdir(destination_directory_rust) do
+      # Create the avr-fork Rust branch.
+      run(["git", "checkout", "-b", branch_name_avr_fork, branch_name_rust_upstream])
+      generated_branches << GitUtil::GeneratedBranch.new(branch_name_avr_fork, destination_directory_rust)
+
+      run(["git", "commit", "-am", "Pulling in cherry-picked fixes for AVR"])
+    end
+  end
+
+  puts "finished building the LLVM fork."
+  puts
+  puts "Generated Branches:"
+  generated_branches.sort_by { |b| [b.name, b.repository_path]}.each do |generated_branch|
+    puts "    - #{generated_branch.name} (#{generated_branch.repository_path})"
+  end
 end
 
 def build_fork_cli
